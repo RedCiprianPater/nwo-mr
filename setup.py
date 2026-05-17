@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="nwo-mr",
-    version="0.1.0",
+    version="0.1.1",
     author="NWO Robotics",
     author_email="ciprian.pater@publicae.org",
     description="Mixed Reality layer for NWO Robotics - enabling AI agents to embody avatars, simulate robotics, and participate in virtual economies",
