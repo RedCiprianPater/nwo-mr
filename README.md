@@ -287,7 +287,7 @@ MIT. See [LICENSE](./LICENSE).
 - **Cardiac SDK:** https://github.com/RedCiprianPater/nwo-cardiac-sdk
 - **Market Layer L6 (parent):** https://github.com/RedCiprianPater/nwo-market-layer
 - **NWO Capital:** https://nwo.capital
-- **Twitter / X:** [@nwocapital](https://x.com/nwocapital)
+- **Twitter / X:** [@nworobotics](https://x.com/nworobotics)
 
 ---
 
