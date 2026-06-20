@@ -69,6 +69,31 @@ HF_TOKEN = os.getenv("HF_TOKEN", "")
 if not API_KEY:
     print("⚠ WARNING: NWO_MR_API_KEY not set — pod is unauthenticated!")
 
+# ── CUDA / GPU detection at startup ─────────────────────────────────
+# Real 4DGS (Instant4D / 4D-Rotor / LichtFeld) and ViserDex training
+# require CUDA. We detect that once at boot and expose it in /health so
+# callers can see whether to expect real output or placeholder.
+
+def detect_gpu():
+    """Return (cuda_available: bool, gpu_name: str, vram_gb: float)."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=4,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            line = out.stdout.strip().split("\n")[0]
+            parts = [p.strip() for p in line.split(",")]
+            name = parts[0] if parts else "unknown"
+            vram_mb = float(parts[1]) if len(parts) > 1 and parts[1].replace(".", "").isdigit() else 0
+            return True, name, round(vram_mb / 1024, 1)
+    except Exception:
+        pass
+    return False, "none (CPU-only pod)", 0.0
+
+CUDA_AVAILABLE, GPU_NAME, VRAM_GB = detect_gpu()
+print(f"🖥  GPU detection: cuda={CUDA_AVAILABLE} · {GPU_NAME} · {VRAM_GB} GB VRAM")
+
 # ── FastAPI app ────────────────────────────────────────────────────
 
 app = FastAPI(title="NWO MR GPU Pod Wrapper", version="2.0.0")
@@ -111,21 +136,26 @@ def file_url(job_id: str, filename: str) -> str:
 @app.get("/health")
 async def health():
     free_gb = shutil.disk_usage(str(WORKSPACE)).free / 1e9
-    gpu_name = "unknown"
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=3,
-        )
-        gpu_name = out.stdout.strip().split("\n")[0]
-    except Exception:
-        pass
+    # CUDA_AVAILABLE / GPU_NAME / VRAM_GB are detected once at module load.
+    # mode tells callers what to expect from /api/4dgs and /api/train:
+    #   "ready-gpu"        : CUDA pod + real CLI wired → real model output
+    #   "placeholder-gpu"  : CUDA pod, real CLI not yet wired → placeholder
+    #   "placeholder-cpu"  : CPU pod → placeholder only, no real model can run here
+    if CUDA_AVAILABLE:
+        mode = "placeholder-gpu"   # flip to "ready-gpu" once real CLI is wired in
+    else:
+        mode = "placeholder-cpu"
     return {
         "ok": True,
         "service": "nwo-mr-gpu-wrapper",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "lichtfeld_variant": LICHTFELD_VARIANT,
-        "gpu": gpu_name,
+        "mode": mode,
+        "cuda_available": CUDA_AVAILABLE,
+        "gpu_name": GPU_NAME,
+        "vram_gb": VRAM_GB,
+        "real_4dgs_possible": CUDA_AVAILABLE,  # CUDA-only rasterizer kernels
+        "real_training_possible": CUDA_AVAILABLE,  # PyTorch CPU impractically slow
         "free_disk_gb": round(free_gb, 1),
         "max_video_seconds": MAX_VIDEO_SECONDS,
         "auth_enabled": bool(API_KEY),
@@ -323,6 +353,19 @@ async def run_4dgs_pipeline(job_id: str):
         # Step 4: Record outputs
         job["status"] = "completed"
         job["completed_at"] = time.time()
+        # mode tells the caller exactly what they got:
+        #   "placeholder-cpu" — pod has no GPU; this output is fake by necessity
+        #   "placeholder-gpu" — pod has GPU but real CLI isn't wired yet
+        #   "ready-gpu"       — real Instant4D/4D-Rotor output (flip when wired)
+        mode = "placeholder-cpu" if not CUDA_AVAILABLE else "placeholder-gpu"
+        placeholder_reason = (
+            "Pod has no GPU. Real 4DGS requires CUDA — every open-source 4DGS "
+            "pipeline (Instant4D, 4D-Rotor, LichtFeld) uses CUDA-only rasterizer "
+            "kernels with no CPU fallback. The asset URL is a placeholder."
+            if not CUDA_AVAILABLE else
+            "Real Instant4D/4D-Rotor CLI is not yet wired into wrapper.py. "
+            "Pod has GPU available; flip to real model once wired."
+        )
         job["results"] = {
             "splat4d_url": file_url(job_id, "scene.splat4d"),
             "preview_url": file_url(job_id, "preview.jpg") if preview_path.exists() else None,
@@ -330,7 +373,11 @@ async def run_4dgs_pipeline(job_id: str):
             "duration_seconds": round(time.time() - job["started_at"], 1),
             "variant": LICHTFELD_VARIANT,
             "is_dynamic": LICHTFELD_VARIANT != "static3dgs",
-            "is_placeholder": True,  # remove once real CLI is wired
+            "is_placeholder": True,
+            "mode": mode,
+            "placeholder_reason": placeholder_reason,
+            "cuda_available": CUDA_AVAILABLE,
+            "gpu_name": GPU_NAME,
         }
         save_job(job)
     except Exception as e:
@@ -412,6 +459,15 @@ async def run_viserdex_pipeline(job_id: str):
 
         job["status"] = "completed"
         job["completed_at"] = time.time()
+        mode = "placeholder-cpu" if not CUDA_AVAILABLE else "placeholder-gpu"
+        placeholder_reason = (
+            "Pod has no GPU. LeRobot training on CPU is technically possible "
+            "but takes weeks instead of hours; not practical. The policy URL is "
+            "a placeholder until the pod is moved to a GPU."
+            if not CUDA_AVAILABLE else
+            "LeRobot CLI not yet wired into wrapper.py. Pod has GPU available; "
+            "flip to real training once wired."
+        )
         job["results"] = {
             "policy_url": file_url(job_id, "policy.zip"),
             "hf_hub_repo": job["input"].get("push_to_hub_repo"),
@@ -419,6 +475,10 @@ async def run_viserdex_pipeline(job_id: str):
             "epochs": epochs,
             "duration_seconds": round(time.time() - job["started_at"], 1),
             "is_placeholder": True,
+            "mode": mode,
+            "placeholder_reason": placeholder_reason,
+            "cuda_available": CUDA_AVAILABLE,
+            "gpu_name": GPU_NAME,
         }
         save_job(job)
     except Exception as e:
