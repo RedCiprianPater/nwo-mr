@@ -1,8 +1,14 @@
 """
-NWO MR GPU Pod — FastAPI wrapper
+NWO MR GPU Pod — FastAPI wrapper (v2.2.0)
 
 Exposes a small REST API on port 8000 that the Cloudflare Worker
-(`nwo-blaster.ciprianpater.workers.dev`) proxies to.
+(`nwo-blaster.ciprianpater.workers.dev`, v5.0.0+) proxies to.
+
+Single-pod model — there is no CPU fallback. The worker routes /api/4dgs
+and /api/train to one GPU pod via RUNPOD_GPU_URL. CUDA detection is kept
+so /health is honest about whether real model output is possible from
+this hardware, but the wrapper will still serve placeholder jobs end-to-
+end even when CUDA is absent (useful for dev/staging).
 
 Endpoints
 ─────────
@@ -89,14 +95,14 @@ def detect_gpu():
             return True, name, round(vram_mb / 1024, 1)
     except Exception:
         pass
-    return False, "none (CPU-only pod)", 0.0
+    return False, "none (no GPU detected)", 0.0
 
 CUDA_AVAILABLE, GPU_NAME, VRAM_GB = detect_gpu()
 print(f"🖥  GPU detection: cuda={CUDA_AVAILABLE} · {GPU_NAME} · {VRAM_GB} GB VRAM")
 
 # ── FastAPI app ────────────────────────────────────────────────────
 
-app = FastAPI(title="NWO MR GPU Pod Wrapper", version="2.0.0")
+app = FastAPI(title="NWO MR GPU Pod Wrapper", version="2.2.0")
 app.mount("/files", StaticFiles(directory=str(OUTPUT_DIR)), name="files")
 
 
@@ -140,15 +146,16 @@ async def health():
     # mode tells callers what to expect from /api/4dgs and /api/train:
     #   "ready-gpu"        : CUDA pod + real CLI wired → real model output
     #   "placeholder-gpu"  : CUDA pod, real CLI not yet wired → placeholder
-    #   "placeholder-cpu"  : CPU pod → placeholder only, no real model can run here
+    #   "no-gpu"           : no CUDA → wrapper still serves placeholder jobs
+    #                        but cannot ever produce real output here
     if CUDA_AVAILABLE:
         mode = "placeholder-gpu"   # flip to "ready-gpu" once real CLI is wired in
     else:
-        mode = "placeholder-cpu"
+        mode = "no-gpu"
     return {
         "ok": True,
         "service": "nwo-mr-gpu-wrapper",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "lichtfeld_variant": LICHTFELD_VARIANT,
         "mode": mode,
         "cuda_available": CUDA_AVAILABLE,
@@ -354,17 +361,17 @@ async def run_4dgs_pipeline(job_id: str):
         job["status"] = "completed"
         job["completed_at"] = time.time()
         # mode tells the caller exactly what they got:
-        #   "placeholder-cpu" — pod has no GPU; this output is fake by necessity
+        #   "no-gpu"          — pod has no CUDA; output is fake by necessity
         #   "placeholder-gpu" — pod has GPU but real CLI isn't wired yet
         #   "ready-gpu"       — real Instant4D/4D-Rotor output (flip when wired)
-        mode = "placeholder-cpu" if not CUDA_AVAILABLE else "placeholder-gpu"
+        mode = "placeholder-gpu" if CUDA_AVAILABLE else "no-gpu"
         placeholder_reason = (
+            "Real Instant4D/4D-Rotor CLI is not yet wired into wrapper.py. "
+            "Pod has GPU available; flip to real model once wired."
+            if CUDA_AVAILABLE else
             "Pod has no GPU. Real 4DGS requires CUDA — every open-source 4DGS "
             "pipeline (Instant4D, 4D-Rotor, LichtFeld) uses CUDA-only rasterizer "
             "kernels with no CPU fallback. The asset URL is a placeholder."
-            if not CUDA_AVAILABLE else
-            "Real Instant4D/4D-Rotor CLI is not yet wired into wrapper.py. "
-            "Pod has GPU available; flip to real model once wired."
         )
         job["results"] = {
             "splat4d_url": file_url(job_id, "scene.splat4d"),
@@ -459,14 +466,14 @@ async def run_viserdex_pipeline(job_id: str):
 
         job["status"] = "completed"
         job["completed_at"] = time.time()
-        mode = "placeholder-cpu" if not CUDA_AVAILABLE else "placeholder-gpu"
+        mode = "placeholder-gpu" if CUDA_AVAILABLE else "no-gpu"
         placeholder_reason = (
+            "LeRobot CLI not yet wired into wrapper.py. Pod has GPU available; "
+            "flip to real training once wired."
+            if CUDA_AVAILABLE else
             "Pod has no GPU. LeRobot training on CPU is technically possible "
             "but takes weeks instead of hours; not practical. The policy URL is "
             "a placeholder until the pod is moved to a GPU."
-            if not CUDA_AVAILABLE else
-            "LeRobot CLI not yet wired into wrapper.py. Pod has GPU available; "
-            "flip to real training once wired."
         )
         job["results"] = {
             "policy_url": file_url(job_id, "policy.zip"),
@@ -501,6 +508,7 @@ async def run_viserdex_pipeline(job_id: str):
 async def root():
     return JSONResponse({
         "service": "nwo-mr-gpu-wrapper",
+        "version": "2.2.0",
         "endpoints": [
             "POST /api/4dgs",
             "GET  /api/4dgs/status?job_id=...",
