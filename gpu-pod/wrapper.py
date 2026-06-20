@@ -1,40 +1,39 @@
 """
-NWO MR GPU Pod — FastAPI wrapper (v2.2.0)
+NWO MR GPU Pod — FastAPI wrapper (v3.0.0)
 
-Exposes a small REST API on port 8000 that the Cloudflare Worker
-(`nwo-blaster.ciprianpater.workers.dev`, v5.0.0+) proxies to.
+v3.0.0 — real Instant4D pipeline wired in
+─────────────────────────────────────────
+run_4dgs_pipeline() now:
+  1. Checks for /workspace/Instant4D/.installed (created by setup_instant4d.sh)
+  2. If installed: extracts frames from the video, runs the real Instant4D
+     3-stage pipeline (reconstruct → prune → optimize), copies the final
+     .ply to /workspace/outputs/<job_id>/point_cloud.ply, returns it.
+  3. If not installed: writes the placeholder splat4d file and returns
+     is_placeholder=true. This keeps the wrapper working on fresh pods
+     before setup_instant4d.sh has been run.
 
-Single-pod model — there is no CPU fallback. The worker routes /api/4dgs
-and /api/train to one GPU pod via RUNPOD_GPU_URL. CUDA detection is kept
-so /health is honest about whether real model output is possible from
-this hardware, but the wrapper will still serve placeholder jobs end-to-
-end even when CUDA is absent (useful for dev/staging).
+run_viserdex_pipeline() is unchanged from v2.2.0 (placeholder for now —
+LeRobot training will be wired in a separate pass).
 
-Endpoints
-─────────
+Output formats
+──────────────
+Real Instant4D:    point_cloud.ply (standard 3DGS PLY, ~10-50 MB typical)
+                   preview.jpg     (first source frame, extracted by ffmpeg)
+                   training.log    (stdout/stderr of the pipeline stages)
+                   is_placeholder: false, mode: "ready-gpu"
+Placeholder (no Instant4D installed):
+                   scene.splat4d   (magic bytes + first 1KB of video, unviewable)
+                   preview.jpg     (first source frame)
+                   is_placeholder: true, mode: "placeholder-gpu" / "no-gpu"
+
+Endpoints (unchanged from v2.2.0)
+─────────────────────────────────
 POST /api/4dgs                  → start a 4DGS reconstruction job
 GET  /api/4dgs/status?job_id=…  → poll a 4DGS job
 POST /api/train                 → start a ViserDex training job
 GET  /api/train/status?job_id=… → poll a training job
-GET  /files/{job_id}/{name}     → serve outputs (splat4d, splat, policy.zip)
-GET  /health                    → status + GPU info + free disk
-
-All endpoints (except /health) require:
-  Authorization: Bearer <NWO_MR_API_KEY>
-
-Job lifecycle
-─────────────
-1. Worker POSTs /api/4dgs with { video_url, agent_address, ... }
-2. Wrapper validates, creates a job_id, persists job-state.json to disk,
-   spawns an asyncio task that downloads + processes + writes outputs
-3. Worker polls /api/4dgs/status?job_id=... until status == "completed"
-4. (Optional) Wrapper POSTs WORKER_CALLBACK_URL when done so the worker
-   can mark mr_jobs.completed_at in Supabase without polling
-
-Pipeline integration is intentionally modular — the actual model-specific
-training command lives in `run_4dgs_pipeline()` and `run_viserdex_pipeline()`
-at the bottom of this file. Replace the shell commands with your tested
-LichtFeld / Instant4D / 4D-Rotor / LeRobot CLI invocations.
+GET  /files/{job_id}/{name}     → serve outputs
+GET  /health                    → status + GPU info + free disk + i4d_installed
 """
 
 from __future__ import annotations
@@ -72,13 +71,16 @@ OUTPUT_BASE_URL = os.getenv("OUTPUT_BASE_URL", "").rstrip("/")
 WORKER_CALLBACK_URL = os.getenv("WORKER_CALLBACK_URL", "")
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 
+# Instant4D integration paths (set by setup_instant4d.sh)
+INSTANT4D_PATH = Path(os.getenv("INSTANT4D_PATH", "/workspace/Instant4D"))
+INSTANT4D_CONDA_ENV = os.getenv("INSTANT4D_CONDA_ENV", "instant4d")
+INSTANT4D_USE_CONDA = os.getenv("INSTANT4D_USE_CONDA", "auto")  # "auto" | "1" | "0"
+INSTANT4D_TIMEOUT_S = int(os.getenv("INSTANT4D_TIMEOUT_S", "1800"))  # 30min hard cap
+
 if not API_KEY:
     print("⚠ WARNING: NWO_MR_API_KEY not set — pod is unauthenticated!")
 
 # ── CUDA / GPU detection at startup ─────────────────────────────────
-# Real 4DGS (Instant4D / 4D-Rotor / LichtFeld) and ViserDex training
-# require CUDA. We detect that once at boot and expose it in /health so
-# callers can see whether to expect real output or placeholder.
 
 def detect_gpu():
     """Return (cuda_available: bool, gpu_name: str, vram_gb: float)."""
@@ -100,9 +102,28 @@ def detect_gpu():
 CUDA_AVAILABLE, GPU_NAME, VRAM_GB = detect_gpu()
 print(f"🖥  GPU detection: cuda={CUDA_AVAILABLE} · {GPU_NAME} · {VRAM_GB} GB VRAM")
 
+
+def instant4d_installed() -> bool:
+    """True when setup_instant4d.sh has completed successfully on this pod."""
+    return (INSTANT4D_PATH / ".installed").is_file()
+
+
+def instant4d_python() -> list:
+    """Return the command prefix that runs Python inside the Instant4D env."""
+    use_conda = INSTANT4D_USE_CONDA
+    if use_conda == "auto":
+        use_conda = "1" if shutil.which("conda") else "0"
+    if use_conda == "1":
+        return ["conda", "run", "-n", INSTANT4D_CONDA_ENV, "--no-capture-output", "python"]
+    return [str(INSTANT4D_PATH / ".venv" / "bin" / "python")]
+
+
+I4D_INSTALLED = instant4d_installed()
+print(f"📦 Instant4D installed: {I4D_INSTALLED} (path: {INSTANT4D_PATH})")
+
 # ── FastAPI app ────────────────────────────────────────────────────
 
-app = FastAPI(title="NWO MR GPU Pod Wrapper", version="2.2.0")
+app = FastAPI(title="NWO MR GPU Pod Wrapper", version="3.0.0")
 app.mount("/files", StaticFiles(directory=str(OUTPUT_DIR)), name="files")
 
 
@@ -142,27 +163,30 @@ def file_url(job_id: str, filename: str) -> str:
 @app.get("/health")
 async def health():
     free_gb = shutil.disk_usage(str(WORKSPACE)).free / 1e9
-    # CUDA_AVAILABLE / GPU_NAME / VRAM_GB are detected once at module load.
-    # mode tells callers what to expect from /api/4dgs and /api/train:
-    #   "ready-gpu"        : CUDA pod + real CLI wired → real model output
-    #   "placeholder-gpu"  : CUDA pod, real CLI not yet wired → placeholder
-    #   "no-gpu"           : no CUDA → wrapper still serves placeholder jobs
-    #                        but cannot ever produce real output here
-    if CUDA_AVAILABLE:
-        mode = "placeholder-gpu"   # flip to "ready-gpu" once real CLI is wired in
+    # mode reflects what the next /api/4dgs job is actually going to do:
+    #   "ready-gpu"        — CUDA + Instant4D installed → real reconstruction
+    #   "placeholder-gpu"  — CUDA pod but Instant4D not installed yet
+    #                        (run setup_instant4d.sh to upgrade)
+    #   "no-gpu"           — no CUDA detected — placeholder only, ever
+    if CUDA_AVAILABLE and I4D_INSTALLED:
+        mode = "ready-gpu"
+    elif CUDA_AVAILABLE:
+        mode = "placeholder-gpu"
     else:
         mode = "no-gpu"
     return {
         "ok": True,
         "service": "nwo-mr-gpu-wrapper",
-        "version": "2.2.0",
+        "version": "3.0.0",
         "lichtfeld_variant": LICHTFELD_VARIANT,
         "mode": mode,
         "cuda_available": CUDA_AVAILABLE,
         "gpu_name": GPU_NAME,
         "vram_gb": VRAM_GB,
-        "real_4dgs_possible": CUDA_AVAILABLE,  # CUDA-only rasterizer kernels
-        "real_training_possible": CUDA_AVAILABLE,  # PyTorch CPU impractically slow
+        "real_4dgs_possible": CUDA_AVAILABLE and I4D_INSTALLED,
+        "real_training_possible": CUDA_AVAILABLE,
+        "instant4d_installed": I4D_INSTALLED,
+        "instant4d_path": str(INSTANT4D_PATH) if I4D_INSTALLED else None,
         "free_disk_gb": round(free_gb, 1),
         "max_video_seconds": MAX_VIDEO_SECONDS,
         "auth_enabled": bool(API_KEY),
@@ -195,6 +219,7 @@ async def start_4dgs(
         "input": req.dict(),
         "started_at": time.time(),
         "variant": LICHTFELD_VARIANT,
+        "real_pipeline": CUDA_AVAILABLE and I4D_INSTALLED,
     }
     save_job(job)
     background.add_task(run_4dgs_pipeline, job_id)
@@ -205,7 +230,11 @@ async def start_4dgs(
         "source": LICHTFELD_VARIANT,
         "status": "processing",
         "poll_url": f"/api/4dgs/status?job_id={job_id}",
-        "eta_minutes": 15 if req.quality == "fast" else 45,
+        # ETA is honest now: real Instant4D ≈ 5-15min; placeholder ≈ seconds
+        "eta_minutes": (
+            (5 if req.quality == "fast" else 15 if req.quality == "balanced" else 30)
+            if (CUDA_AVAILABLE and I4D_INSTALLED) else 1
+        ),
     }
 
 @app.get("/api/4dgs/status")
@@ -219,14 +248,14 @@ async def status_4dgs(job_id: str, authorization: Optional[str] = Header(None)):
     return {"ok": True, **job}
 
 
-# ── ViserDex training endpoints ────────────────────────────────────
+# ── ViserDex training endpoints (unchanged from v2.2.0) ────────────
 
 class TrainRequest(BaseModel):
     dataset_url: str
     agent_address: str = Field(pattern=r"^0x[0-9a-fA-F]{40}$")
     policy_type: str = "diffusion"  # diffusion | pi0 | act
     epochs: int = 50
-    push_to_hub_repo: Optional[str] = None  # e.g. "ciprianpater/nwo-policy-abc"
+    push_to_hub_repo: Optional[str] = None
 
 @app.post("/api/train")
 async def start_train(
@@ -266,31 +295,17 @@ async def status_train(job_id: str, authorization: Optional[str] = Header(None))
     return {"ok": True, **job}
 
 
-# ── Pipelines ──────────────────────────────────────────────────────
-# These are the only functions you'll need to edit when wiring real
-# LichtFeld / Instant4D / LeRobot CLI commands. Everything above is generic.
+# ════════════════════════════════════════════════════════════════════
+# 4DGS pipeline
+# ════════════════════════════════════════════════════════════════════
 
 async def run_4dgs_pipeline(job_id: str):
-    """
-    Run the 4DGS reconstruction pipeline.
-
-    Flow:
-      1. Download video_url → /workspace/inputs/<job_id>.mp4
-      2. Validate duration ≤ MAX_VIDEO_SECONDS (ffprobe)
-      3. Run the variant-specific training command
-      4. Write outputs to /workspace/outputs/<job_id>/
-      5. Mark job completed + emit callback
-
-    Variants (set LICHTFELD_VARIANT env var):
-      - instant4d: ~15 min on L40S, casual single-camera capture
-      - 4d-rotor:  ~45 min, higher fidelity, longer clips
-      - static3dgs: LichtFeld stock 3DGS, no time dimension
-    """
+    """Top-level dispatcher: real Instant4D if installed, else placeholder."""
     job = load_job(job_id)
     if not job:
         return
     try:
-        # Step 1: Download video
+        # Step 1: Download video (common to both paths)
         video_url = job["input"]["video_url"]
         video_path = INPUT_DIR / f"{job_id}.mp4"
         job["status"] = "downloading"
@@ -300,93 +315,34 @@ async def run_4dgs_pipeline(job_id: str):
             r.raise_for_status()
             video_path.write_bytes(r.content)
 
-        # Step 2: Validate duration
-        try:
-            out = subprocess.run(
-                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                 "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
-                capture_output=True, text=True, timeout=30,
-            )
-            duration_s = float(out.stdout.strip() or 0)
-            if duration_s > MAX_VIDEO_SECONDS:
-                raise ValueError(f"video duration {duration_s:.1f}s exceeds max {MAX_VIDEO_SECONDS}s")
-            job["video_duration_s"] = round(duration_s, 1)
-        except Exception as e:
-            raise ValueError(f"ffprobe failed: {e}")
+        # Step 2: Validate duration via ffprobe
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        duration_s = float((out.stdout or "0").strip() or 0)
+        if duration_s <= 0:
+            raise ValueError("ffprobe could not read video — check video_url returns raw bytes (e.g. use HuggingFace 'resolve/main' URLs, not 'blob/main')")
+        if duration_s > MAX_VIDEO_SECONDS:
+            raise ValueError(f"video duration {duration_s:.1f}s exceeds max {MAX_VIDEO_SECONDS}s")
+        job["video_duration_s"] = round(duration_s, 1)
 
-        # Step 3: Run variant
+        # Step 3: Always extract a preview thumbnail (cheap, used by both paths)
         out_dir = OUTPUT_DIR / job_id
         out_dir.mkdir(exist_ok=True)
-        job["status"] = "training"
-        job["started_training_at"] = time.time()
-        save_job(job)
-
-        # ════════════════════════════════════════════════════════════
-        # TODO: Replace this block with the real CLI command for your variant.
-        # ════════════════════════════════════════════════════════════
-        # Example for Instant4D (verify exact CLI syntax against the repo):
-        #   cmd = [
-        #       "python", "/workspace/models/Instant4D/train.py",
-        #       "--video", str(video_path),
-        #       "--output", str(out_dir),
-        #       "--max-iterations", "30000",
-        #   ]
-        #
-        # Example for 4D-Rotor:
-        #   cmd = [
-        #       "python", "/workspace/models/4D-Rotor-GS/train.py",
-        #       "--source", str(video_path),
-        #       "--model-path", str(out_dir),
-        #   ]
-        #
-        # Example for LichtFeld Studio (static 3DGS):
-        #   cmd = [
-        #       "/workspace/models/LichtFeld/build/lichtfeld_train",
-        #       "--input", str(video_path), "--output", str(out_dir),
-        #   ]
-        # ════════════════════════════════════════════════════════════
-        #
-        # For first deployment, this is a placeholder that copies the video
-        # and writes a fake splat4d so the end-to-end flow works:
-        placeholder_splat = out_dir / "scene.splat4d"
-        placeholder_splat.write_bytes(b"NWO_MR_PLACEHOLDER_4DGS\n" + video_path.read_bytes()[:1024])
         preview_path = out_dir / "preview.jpg"
-        # Extract a thumbnail frame with ffmpeg
         subprocess.run(
             ["ffmpeg", "-y", "-i", str(video_path), "-vframes", "1", "-q:v", "2", str(preview_path)],
             capture_output=True, timeout=30,
         )
 
-        # Step 4: Record outputs
-        job["status"] = "completed"
-        job["completed_at"] = time.time()
-        # mode tells the caller exactly what they got:
-        #   "no-gpu"          — pod has no CUDA; output is fake by necessity
-        #   "placeholder-gpu" — pod has GPU but real CLI isn't wired yet
-        #   "ready-gpu"       — real Instant4D/4D-Rotor output (flip when wired)
-        mode = "placeholder-gpu" if CUDA_AVAILABLE else "no-gpu"
-        placeholder_reason = (
-            "Real Instant4D/4D-Rotor CLI is not yet wired into wrapper.py. "
-            "Pod has GPU available; flip to real model once wired."
-            if CUDA_AVAILABLE else
-            "Pod has no GPU. Real 4DGS requires CUDA — every open-source 4DGS "
-            "pipeline (Instant4D, 4D-Rotor, LichtFeld) uses CUDA-only rasterizer "
-            "kernels with no CPU fallback. The asset URL is a placeholder."
-        )
-        job["results"] = {
-            "splat4d_url": file_url(job_id, "scene.splat4d"),
-            "preview_url": file_url(job_id, "preview.jpg") if preview_path.exists() else None,
-            "viewer_url": None,  # filled in when you wire LichtFeld's web viewer
-            "duration_seconds": round(time.time() - job["started_at"], 1),
-            "variant": LICHTFELD_VARIANT,
-            "is_dynamic": LICHTFELD_VARIANT != "static3dgs",
-            "is_placeholder": True,
-            "mode": mode,
-            "placeholder_reason": placeholder_reason,
-            "cuda_available": CUDA_AVAILABLE,
-            "gpu_name": GPU_NAME,
-        }
-        save_job(job)
+        # Step 4: Branch on installation
+        if CUDA_AVAILABLE and I4D_INSTALLED:
+            await _run_instant4d_pipeline(job, video_path, out_dir, preview_path)
+        else:
+            _run_placeholder_4dgs(job, video_path, out_dir, preview_path)
+
     except Exception as e:
         job["status"] = "failed"
         job["error"] = str(e)
@@ -397,22 +353,196 @@ async def run_4dgs_pipeline(job_id: str):
     if WORKER_CALLBACK_URL:
         try:
             async with httpx.AsyncClient(timeout=10) as client:
-                await client.post(WORKER_CALLBACK_URL, json={"job_id": job_id, "kind": "4dgs", "status": job["status"]})
+                await client.post(WORKER_CALLBACK_URL, json={
+                    "job_id": job_id, "kind": "4dgs", "status": job["status"],
+                })
         except Exception:
             pass
 
 
-async def run_viserdex_pipeline(job_id: str):
+async def _run_instant4d_pipeline(job: dict, video_path: Path, out_dir: Path, preview_path: Path):
     """
-    Run a ViserDex / LeRobot policy training.
+    Run the real Instant4D pipeline. Three stages per the upstream README:
+      1. SLAM reconstruction (mega-sam: depth + camera trajectory)
+      2. Grid pruning (sparse 4D Gaussian initialization)
+      3. 4D Gaussian optimization (the actual fit)
 
-    Flow:
-      1. Download dataset_url → /workspace/inputs/<job_id>.tar.gz
-      2. Extract, validate dataset is LeRobot format
-      3. Run LeRobot training command for policy_type
-      4. Push trained checkpoint to HF Hub (if push_to_hub_repo set)
-      5. Write outputs to /workspace/outputs/<job_id>/
+    Upstream expects a directory with extracted frames, not an mp4. We
+    pre-extract at ~10 fps so a 10s clip yields ~100 frames — within
+    Instant4D's tested range and an L4's VRAM budget.
+
+    Final output is a 3DGS-format .ply at .../point_cloud/iteration_<N>/point_cloud.ply
+    which we copy to <out_dir>/point_cloud.ply for serving.
     """
+    job_id = job["id"]
+    quality = job["input"].get("quality", "balanced")
+
+    # Pace-of-life: fast=fewer iterations, quality=more.
+    iterations = {"fast": 4000, "balanced": 8000, "quality": 14000}.get(quality, 8000)
+
+    # 4a. Extract frames at ~10 fps to a scene-style directory
+    job["status"] = "extracting_frames"
+    save_job(job)
+    scene_dir = INPUT_DIR / job_id / "scene"
+    images_dir = scene_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(video_path), "-vf", "fps=10", "-q:v", "2",
+         str(images_dir / "frame_%05d.png")],
+        check=True, capture_output=True, timeout=120,
+    )
+    frame_count = len(list(images_dir.glob("*.png")))
+    if frame_count < 8:
+        raise ValueError(f"Only extracted {frame_count} frames — video too short for 4DGS reconstruction")
+
+    # 4b. mega-sam stage: visual SLAM + consistent depth
+    # Upstream runs this via script/reconstruct.sh which sets `path` and
+    # `weight` variables and invokes mega-sam. We call its underlying Python
+    # modules directly so we can control IO, env vars, and timeouts.
+    job["status"] = "slam"
+    job["frame_count"] = frame_count
+    save_job(job)
+    log_path = out_dir / "training.log"
+    log_fp = open(log_path, "a", buffering=1)
+    log_fp.write(f"\n=== Instant4D pipeline for job {job_id} ===\n")
+    log_fp.write(f"video_duration_s={job['video_duration_s']} frames={frame_count} iters={iterations}\n\n")
+
+    i4d_py = instant4d_python()
+    env = {
+        **os.environ,
+        "I4D_SCENE_DIR": str(scene_dir),
+        "I4D_OUT_DIR": str(out_dir / "i4d"),
+        "I4D_ITERATIONS": str(iterations),
+        # Reduce VRAM pressure on L4 — Instant4D's default config targets 24GB+
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512",
+    }
+
+    def _run(stage: str, cmd: list, stage_timeout: int):
+        log_fp.write(f"--- {stage} ---\n$ {' '.join(cmd)}\n")
+        log_fp.flush()
+        rc = subprocess.run(
+            cmd, cwd=str(INSTANT4D_PATH), env=env,
+            stdout=log_fp, stderr=subprocess.STDOUT,
+            timeout=stage_timeout,
+        ).returncode
+        log_fp.write(f"--- {stage} exited rc={rc} ---\n\n")
+        log_fp.flush()
+        if rc != 0:
+            raise RuntimeError(f"Instant4D stage '{stage}' failed (rc={rc}). Tail of log:\n" + _tail(log_path, 60))
+
+    # Upstream invokes via `source script/reconstruct.sh` + `python -m script.prune`
+    # + `python -m script.optmize` (sic — their typo). reconstruct.sh chains
+    # mega-sam preprocess steps and a Python entry point; we invoke its
+    # underlying Python directly so we can control IO and timeouts.
+    try:
+        # Stage 1: SLAM (depth + cameras). May take 2-4 min for ~100 frames on L4.
+        _run("reconstruct", i4d_py + ["-m", "script.reconstruct"], stage_timeout=900)
+        job["status"] = "pruning"; save_job(job)
+        # Stage 2: grid pruning
+        _run("prune", i4d_py + ["-m", "script.prune"], stage_timeout=300)
+        job["status"] = "optimizing"; save_job(job)
+        # Stage 3: 4DGS optimization (note upstream's typo: 'optmize')
+        _run("optimize", i4d_py + ["-m", "script.optmize"], stage_timeout=INSTANT4D_TIMEOUT_S)
+    finally:
+        log_fp.close()
+
+    # 4c. Locate the final point cloud. Instant4D writes to
+    # <out>/point_cloud/iteration_<N>/point_cloud.ply by default.
+    i4d_out = out_dir / "i4d"
+    candidates = sorted(i4d_out.glob("**/point_cloud/iteration_*/point_cloud.ply"))
+    if not candidates:
+        raise RuntimeError(f"Instant4D produced no point_cloud.ply under {i4d_out}. Check training.log.")
+    # Highest iteration count wins (final checkpoint)
+    final_ply = max(candidates, key=lambda p: int(p.parent.name.split("_")[-1]))
+    target_ply = out_dir / "point_cloud.ply"
+    shutil.copy2(final_ply, target_ply)
+
+    # 4d. Mark job completed
+    job["status"] = "completed"
+    job["completed_at"] = time.time()
+    ply_size_mb = round(target_ply.stat().st_size / 1e6, 2)
+    job["results"] = {
+        # splat4d_url is kept as the field name for frontend compat, but
+        # the actual file is a standard 3DGS .ply — splat-viewer.js v3.0
+        # detects the extension and routes to SuperSplat for rendering.
+        "splat4d_url": file_url(job["id"], "point_cloud.ply"),
+        "ply_url": file_url(job["id"], "point_cloud.ply"),
+        "preview_url": file_url(job["id"], "preview.jpg") if preview_path.exists() else None,
+        # viewer_url is the embedded-viewer URL — frontend can use this
+        # directly if it doesn't want to construct the SuperSplat URL itself.
+        "viewer_url": f"https://superspl.at/editor?load={file_url(job['id'], 'point_cloud.ply')}",
+        "training_log_url": file_url(job["id"], "training.log"),
+        "duration_seconds": round(time.time() - job["started_at"], 1),
+        "variant": LICHTFELD_VARIANT,
+        "is_dynamic": True,
+        "is_placeholder": False,
+        "mode": "ready-gpu",
+        "iterations": iterations,
+        "ply_size_mb": ply_size_mb,
+        "frame_count": job["frame_count"],
+        "cuda_available": CUDA_AVAILABLE,
+        "gpu_name": GPU_NAME,
+        # Honest note re: 4D playback in web viewers
+        "viewer_note": (
+            "Public web viewers (SuperSplat, antimatter15/splat) render the "
+            "spatial Gaussians but only at a single time slice; the temporal "
+            "evolution requires Instant4D's local websocket viewer. The .ply "
+            "above is the final checkpoint of the 4D optimization."
+        ),
+    }
+    save_job(job)
+
+
+def _run_placeholder_4dgs(job: dict, video_path: Path, out_dir: Path, preview_path: Path):
+    """
+    Placeholder pipeline for pods without Instant4D installed. Writes the
+    same scene.splat4d magic file as v2.x so the frontend's placeholder
+    panel handles the result cleanly.
+    """
+    placeholder_splat = out_dir / "scene.splat4d"
+    placeholder_splat.write_bytes(b"NWO_MR_PLACEHOLDER_4DGS\n" + video_path.read_bytes()[:1024])
+
+    job["status"] = "completed"
+    job["completed_at"] = time.time()
+    mode = "placeholder-gpu" if CUDA_AVAILABLE else "no-gpu"
+    placeholder_reason = (
+        "Instant4D isn't installed on this pod yet. Run "
+        "`bash /workspace/setup_instant4d.sh` once (takes ~30 min) to enable "
+        "real 4DGS reconstruction. The asset URL is a placeholder file."
+        if CUDA_AVAILABLE else
+        "Pod has no GPU. Real 4DGS requires CUDA — Instant4D, 4D-Rotor, and "
+        "LichtFeld all use CUDA-only rasterizer kernels with no CPU fallback."
+    )
+    job["results"] = {
+        "splat4d_url": file_url(job["id"], "scene.splat4d"),
+        "preview_url": file_url(job["id"], "preview.jpg") if preview_path.exists() else None,
+        "viewer_url": None,
+        "duration_seconds": round(time.time() - job["started_at"], 1),
+        "variant": LICHTFELD_VARIANT,
+        "is_dynamic": LICHTFELD_VARIANT != "static3dgs",
+        "is_placeholder": True,
+        "mode": mode,
+        "placeholder_reason": placeholder_reason,
+        "cuda_available": CUDA_AVAILABLE,
+        "gpu_name": GPU_NAME,
+    }
+    save_job(job)
+
+
+def _tail(path: Path, n: int) -> str:
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+        return "".join(lines[-n:])
+    except Exception:
+        return "<no log>"
+
+
+# ════════════════════════════════════════════════════════════════════
+# Training pipeline — still placeholder pending LeRobot wiring
+# ════════════════════════════════════════════════════════════════════
+
+async def run_viserdex_pipeline(job_id: str):
     job = load_job(job_id)
     if not job:
         return
@@ -421,7 +551,6 @@ async def run_viserdex_pipeline(job_id: str):
         policy_type = job["input"].get("policy_type", "diffusion")
         epochs = int(job["input"].get("epochs", 50))
 
-        # Step 1: Download
         archive_path = INPUT_DIR / f"{job_id}.tar.gz"
         job["status"] = "downloading"
         save_job(job)
@@ -434,47 +563,26 @@ async def run_viserdex_pipeline(job_id: str):
         if size_gb > MAX_DATASET_GB:
             raise ValueError(f"dataset {size_gb:.1f} GB exceeds max {MAX_DATASET_GB} GB")
 
-        # Step 2: Extract
         dataset_dir = INPUT_DIR / job_id
         dataset_dir.mkdir(exist_ok=True)
         subprocess.run(["tar", "-xzf", str(archive_path), "-C", str(dataset_dir)], check=True)
 
-        # Step 3: Train
         out_dir = OUTPUT_DIR / job_id
         out_dir.mkdir(exist_ok=True)
         job["status"] = "training"
         job["started_training_at"] = time.time()
         save_job(job)
 
-        # ════════════════════════════════════════════════════════════
-        # TODO: Wire actual LeRobot training command, e.g.:
-        #   cmd = [
-        #       "python", "-m", "lerobot.scripts.train",
-        #       f"policy={policy_type}",
-        #       f"dataset.root={dataset_dir}",
-        #       f"output_dir={out_dir}",
-        #       f"training.epochs={epochs}",
-        #   ]
-        #   if job["input"].get("push_to_hub_repo"):
-        #       cmd += [f"push_to_hub=true", f"hub.repo_id={job['input']['push_to_hub_repo']}"]
-        #   subprocess.run(cmd, check=True, env={**os.environ, "HF_TOKEN": HF_TOKEN})
-        # ════════════════════════════════════════════════════════════
-        #
-        # Placeholder for first deployment:
+        # TODO (separate pass): wire actual LeRobot training:
+        #   subprocess.run(["python", "-m", "lerobot.scripts.train",
+        #       f"policy={policy_type}", f"dataset.root={dataset_dir}",
+        #       f"output_dir={out_dir}", f"training.epochs={epochs}"], check=True)
         placeholder_policy = out_dir / "policy.zip"
         placeholder_policy.write_bytes(b"NWO_MR_PLACEHOLDER_POLICY")
 
         job["status"] = "completed"
         job["completed_at"] = time.time()
         mode = "placeholder-gpu" if CUDA_AVAILABLE else "no-gpu"
-        placeholder_reason = (
-            "LeRobot CLI not yet wired into wrapper.py. Pod has GPU available; "
-            "flip to real training once wired."
-            if CUDA_AVAILABLE else
-            "Pod has no GPU. LeRobot training on CPU is technically possible "
-            "but takes weeks instead of hours; not practical. The policy URL is "
-            "a placeholder until the pod is moved to a GPU."
-        )
         job["results"] = {
             "policy_url": file_url(job_id, "policy.zip"),
             "hf_hub_repo": job["input"].get("push_to_hub_repo"),
@@ -483,7 +591,7 @@ async def run_viserdex_pipeline(job_id: str):
             "duration_seconds": round(time.time() - job["started_at"], 1),
             "is_placeholder": True,
             "mode": mode,
-            "placeholder_reason": placeholder_reason,
+            "placeholder_reason": "LeRobot CLI not yet wired into wrapper.py.",
             "cuda_available": CUDA_AVAILABLE,
             "gpu_name": GPU_NAME,
         }
@@ -508,7 +616,8 @@ async def run_viserdex_pipeline(job_id: str):
 async def root():
     return JSONResponse({
         "service": "nwo-mr-gpu-wrapper",
-        "version": "2.2.0",
+        "version": "3.0.0",
+        "instant4d_installed": I4D_INSTALLED,
         "endpoints": [
             "POST /api/4dgs",
             "GET  /api/4dgs/status?job_id=...",
